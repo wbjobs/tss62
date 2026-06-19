@@ -1,0 +1,71 @@
+collector_port: 8080
+admin_port: 8081
+redis_addr: "localhost:6379"
+redis_password: ""
+redis_db: 0
+
+rules:
+  - id: "error-keyword"
+    name: "错误关键字检测"
+    type: "keyword"
+    pattern: "ERROR"
+    enabled: true
+    tags:
+      severity: "high"
+      category: "error"
+    alert:
+      threshold: 5
+      window_seconds: 60
+      cooldown_seconds: 30
+
+  - id: "warn-keyword"
+    name: "警告关键字检测"
+    type: "keyword"
+    pattern: "WARN"
+    enabled: true
+    tags:
+      severity: "medium"
+      category: "warning"
+    alert:
+      threshold: 20
+      window_seconds: 60
+      cooldown_seconds: 60
+
+  - id: "db-timeout-regex"
+    name: "数据库超时异常"
+    type: "regex"
+    pattern: "(?i)database.*timeout|sql.*timeout|connection.*refused"
+    enabled: true
+    tags:
+      severity: "critical"
+      category: "database"
+    alert:
+      threshold: 3
+      window_seconds: 30
+      cooldown_seconds: 120
+
+  - id: "oom-error"
+    name: "内存溢出错误"
+    type: "regex"
+    pattern: "(?i)out.?of.?memory|oom|heap.?space"
+    enabled: true
+    tags:
+      severity: "critical"
+      category: "resource"
+    alert:
+      threshold: 1
+      window_seconds: 60
+      cooldown_seconds: 300
+
+  - id: "high-latency"
+    name: "高延迟请求"
+    type: "regex"
+    pattern: "latency[:=]\\s*(\\d{4,})ms|response.?time[:=]\\s*(\\d{4,})ms"
+    enabled: true
+    tags:
+      severity: "medium"
+      category: "performance"
+    alert:
+      threshold: 10
+      window_seconds: 60
+      cooldown_seconds: 60
