@@ -25,9 +25,14 @@ type ruleState struct {
 }
 
 type Manager struct {
-	mu        sync.RWMutex
-	rules     map[string]*ruleState
-	listeners map[chan *AlertEvent]struct{}
+	mu         sync.RWMutex
+	rules      map[string]*ruleState
+	listeners  map[chan *AlertEvent]struct{}
+	notifier   Notifier
+}
+
+type Notifier interface {
+	Send(evt *AlertEvent)
 }
 
 func NewManager() *Manager {
@@ -35,6 +40,12 @@ func NewManager() *Manager {
 		rules:     make(map[string]*ruleState),
 		listeners: make(map[chan *AlertEvent]struct{}),
 	}
+}
+
+func (am *Manager) SetNotifier(n Notifier) {
+	am.mu.Lock()
+	am.notifier = n
+	am.mu.Unlock()
 }
 
 func (am *Manager) Record(result rule.MatchResult, logContent string) {
@@ -102,9 +113,16 @@ func (am *Manager) Record(result rule.MatchResult, logContent string) {
 	for ch := range am.listeners {
 		listeners = append(listeners, ch)
 	}
+	var notifier Notifier
+	if am.notifier != nil {
+		notifier = am.notifier
+	}
 	am.mu.Unlock()
 
 	if event != nil {
+		if notifier != nil {
+			notifier.Send(event)
+		}
 		for _, ch := range listeners {
 			select {
 			case ch <- event:

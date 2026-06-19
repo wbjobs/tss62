@@ -9,9 +9,11 @@ import (
 	"syscall"
 
 	"logmonitor/internal/alert"
+	"logmonitor/internal/clientmgr"
 	"logmonitor/internal/collector"
 	"logmonitor/internal/config"
 	"logmonitor/internal/notifier"
+	"logmonitor/internal/notify"
 	redisstore "logmonitor/internal/redis"
 	"logmonitor/internal/rule"
 )
@@ -49,6 +51,23 @@ func main() {
 	engine = rule.NewEngine(cfg)
 	alertMgr := alert.NewManager()
 
+	dingTalkCfgs := make([]notify.DingTalkConfig, 0, len(cfg.DingTalk))
+	for _, d := range cfg.DingTalk {
+		dingTalkCfgs = append(dingTalkCfgs, notify.DingTalkConfig{
+			WebhookURL: d.WebhookURL,
+			Secret:     d.Secret,
+		})
+	}
+	weChatCfgs := make([]notify.WeChatConfig, 0, len(cfg.WeChat))
+	for _, w := range cfg.WeChat {
+		weChatCfgs = append(weChatCfgs, notify.WeChatConfig{
+			WebhookURL: w.WebhookURL,
+		})
+	}
+	notifyMgr := notify.NewManager(dingTalkCfgs, weChatCfgs)
+	defer notifyMgr.Close()
+	alertMgr.SetNotifier(notifyMgr)
+
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGHUP)
@@ -57,15 +76,23 @@ func main() {
 		}
 	}()
 
-	collectorSrv := collector.NewServer(engine, store, alertMgr, 128, 65536)
+	clientMgr := clientmgr.NewManager()
+
+	collectorSrv := collector.NewServer(engine, store, alertMgr, clientMgr, 128, 65536)
 	notifierSrv := notifier.NewServer(alertMgr)
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		errCh <- collectorSrv.Start(cfg.CollectorPort)
 	}()
 	go func() {
 		errCh <- notifierSrv.Start(cfg.AdminPort)
+	}()
+	go func() {
+		if cfg.ManagerPort > 0 {
+			log.Printf("manager api listening on :%d", cfg.ManagerPort)
+			errCh <- clientMgr.Start(cfg.ManagerPort)
+		}
 	}()
 
 	sigCh := make(chan os.Signal, 1)

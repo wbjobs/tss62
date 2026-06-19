@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,8 +20,10 @@ type MatchedLogEntry struct {
 }
 
 type Store struct {
-	client *redis.Client
-	prefix string
+	client       *redis.Client
+	prefix       string
+	retention    time.Duration
+	maxEntries   int64
 }
 
 func NewStore(addr, password string, db int) (*Store, error) {
@@ -40,10 +43,44 @@ func NewStore(addr, password string, db int) (*Store, error) {
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("connect redis: %w", err)
 	}
-	return &Store{
-		client: client,
-		prefix: "logmonitor:",
-	}, nil
+	s := &Store{
+		client:     client,
+		prefix:     "logmonitor:",
+		retention:  24 * time.Hour,
+		maxEntries: 10000,
+	}
+	go s.cleanupLoop()
+	return s, nil
+}
+
+func (s *Store) cleanupLoop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		s.cleanupExpired(ctx)
+		cancel()
+	}
+}
+
+func (s *Store) cleanupExpired(ctx context.Context) {
+	pattern := s.prefix + "matched:*"
+	iter := s.client.Scan(ctx, 0, pattern, 100).Iterator()
+	cutoff := float64(time.Now().Add(-s.retention).UnixMilli())
+	for iter.Next(ctx) {
+		key := iter.Val()
+		pipe := s.client.Pipeline()
+		pipe.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%f", cutoff))
+		pipe.ZRemRangeByRank(ctx, key, 0, -s.maxEntries-1)
+		pipe.Expire(ctx, key, s.retention*2)
+		_, err := pipe.Exec(ctx)
+		if err != nil {
+			log.Printf("cleanup %s failed: %v", key, err)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		log.Printf("scan keys failed: %v", err)
+	}
 }
 
 func (s *Store) keyForRule(ruleID string) string {
@@ -60,10 +97,12 @@ func (s *Store) SaveMatchedLog(ctx context.Context, entry *MatchedLogEntry) erro
 		Member: data,
 	}
 	key := s.keyForRule(entry.RuleID)
+	cutoff := float64(time.Now().Add(-s.retention).UnixMilli())
 	pipe := s.client.Pipeline()
 	pipe.ZAdd(ctx, key, z)
-	pipe.ZRemRangeByRank(ctx, key, 0, -10001)
-	pipe.Expire(ctx, key, 7*24*time.Hour)
+	pipe.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%f", cutoff))
+	pipe.ZRemRangeByRank(ctx, key, 0, -s.maxEntries-1)
+	pipe.Expire(ctx, key, s.retention*2)
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("redis zadd pipeline: %w", err)

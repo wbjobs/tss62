@@ -37,10 +37,22 @@ type AlertRuleConfig struct {
 type AppConfig struct {
 	CollectorPort int             `yaml:"collector_port"`
 	AdminPort     int             `yaml:"admin_port"`
+	ManagerPort   int             `yaml:"manager_port"`
 	RedisAddr     string          `yaml:"redis_addr"`
 	RedisPassword string          `yaml:"redis_password,omitempty"`
 	RedisDB       int             `yaml:"redis_db"`
 	Rules         []Rule          `yaml:"rules"`
+	DingTalk      []DingTalkCfg   `yaml:"dingtalk,omitempty"`
+	WeChat        []WeChatCfg     `yaml:"wechat,omitempty"`
+}
+
+type DingTalkCfg struct {
+	WebhookURL string `yaml:"webhook_url"`
+	Secret     string `yaml:"secret,omitempty"`
+}
+
+type WeChatCfg struct {
+	WebhookURL string `yaml:"webhook_url"`
 }
 
 type ConfigLoader struct {
@@ -66,6 +78,7 @@ func DefaultConfig() *AppConfig {
 	return &AppConfig{
 		CollectorPort: 8080,
 		AdminPort:     8081,
+		ManagerPort:   8082,
 		RedisAddr:     "localhost:6379",
 		RedisDB:       0,
 	}
