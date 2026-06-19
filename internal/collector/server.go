@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,24 +29,45 @@ type LogMessage struct {
 	Content   string `json:"content"`
 }
 
+type task struct {
+	msg    []byte
+	source string
+}
+
 type Server struct {
 	engine      *rule.Engine
 	store       *redisstore.Store
 	alertMgr    *alert.Manager
 	connCount   int64
-	workerPool  chan struct{}
-	wg          sync.WaitGroup
+	dropped     uint64
+	processed   uint64
+	taskQueue   chan *task
+	workerCount int
 }
 
-func NewServer(engine *rule.Engine, store *redisstore.Store, alertMgr *alert.Manager, workerSize int) *Server {
-	if workerSize <= 0 {
-		workerSize = 64
+func NewServer(engine *rule.Engine, store *redisstore.Store, alertMgr *alert.Manager, workerCount, queueSize int) *Server {
+	if workerCount <= 0 {
+		workerCount = 64
 	}
-	return &Server{
-		engine:     engine,
-		store:      store,
-		alertMgr:   alertMgr,
-		workerPool: make(chan struct{}, workerSize),
+	if queueSize <= 0 {
+		queueSize = 65536
+	}
+	s := &Server{
+		engine:      engine,
+		store:       store,
+		alertMgr:    alertMgr,
+		taskQueue:   make(chan *task, queueSize),
+		workerCount: workerCount,
+	}
+	for i := 0; i < workerCount; i++ {
+		go s.worker()
+	}
+	return s
+}
+
+func (s *Server) worker() {
+	for t := range s.taskQueue {
+		s.processMessage(t.msg, t.source)
 	}
 }
 
@@ -72,9 +92,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
 	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
 		for range ticker.C {
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -91,25 +111,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			break
 		}
-		s.wg.Add(1)
+		t := &task{msg: msg, source: source}
 		select {
-		case s.workerPool <- struct{}{}:
-			go s.processMessage(msg, source)
+		case s.taskQueue <- t:
+			atomic.AddUint64(&s.processed, 1)
 		default:
-			go s.processMessage(msg, source)
+			atomic.AddUint64(&s.dropped, 1)
+			dropped := atomic.LoadUint64(&s.dropped)
+			if dropped%1000 == 0 {
+				log.Printf("task queue full, dropped %d messages total", dropped)
+			}
 		}
 	}
-	s.wg.Wait()
 }
 
 func (s *Server) processMessage(msg []byte, source string) {
-	defer s.wg.Done()
-	defer func() {
-		if len(s.workerPool) > 0 {
-			<-s.workerPool
-		}
-	}()
-
 	var lm LogMessage
 	if err := json.Unmarshal(msg, &lm); err != nil {
 		lm = LogMessage{
@@ -141,7 +157,7 @@ func (s *Server) processMessage(msg []byte, source string) {
 		if err := s.store.SaveMatchedLog(ctx, entry); err != nil {
 			log.Printf("save matched log failed: %v", err)
 		}
-		s.alertMgr.Record(m.RuleID, m.RuleName, lm.Content, m.Tags)
+		s.alertMgr.Record(m, lm.Content)
 	}
 }
 
@@ -150,10 +166,14 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		fmt.Fprintf(w, "ok connections=%d processed=%d dropped=%d",
+			atomic.LoadInt64(&s.connCount),
+			atomic.LoadUint64(&s.processed),
+			atomic.LoadUint64(&s.dropped),
+		)
 	})
 
 	addr := fmt.Sprintf(":%d", port)
-	log.Printf("collector server listening on %s", addr)
+	log.Printf("collector server listening on %s (workers=%d queue=%d)", addr, s.workerCount, cap(s.taskQueue))
 	return http.ListenAndServe(addr, mux)
 }

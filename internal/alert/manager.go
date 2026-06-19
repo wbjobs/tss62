@@ -3,6 +3,8 @@ package alert
 import (
 	"sync"
 	"time"
+
+	"logmonitor/internal/rule"
 )
 
 type AlertEvent struct {
@@ -17,9 +19,6 @@ type AlertEvent struct {
 }
 
 type ruleState struct {
-	windowSize time.Duration
-	threshold  int
-	cooldown   time.Duration
 	timestamps []int64
 	samples    []string
 	lastAlert  int64
@@ -38,58 +37,23 @@ func NewManager() *Manager {
 	}
 }
 
-func (am *Manager) RegisterRule(ruleID string, windowSeconds, threshold, cooldownSeconds int) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-	am.rules[ruleID] = &ruleState{
-		windowSize: time.Duration(windowSeconds) * time.Second,
-		threshold:  threshold,
-		cooldown:   time.Duration(cooldownSeconds) * time.Second,
-		timestamps: make([]int64, 0),
-		samples:    make([]string, 0),
-	}
-}
-
-func (am *Manager) UnregisterRule(ruleID string) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-	delete(am.rules, ruleID)
-}
-
-func (am *Manager) ReloadRules(rules map[string][3]int) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-	newRules := make(map[string]*ruleState, len(rules))
-	for id, cfg := range rules {
-		if existing, ok := am.rules[id]; ok {
-			existing.windowSize = time.Duration(cfg[0]) * time.Second
-			existing.threshold = cfg[1]
-			existing.cooldown = time.Duration(cfg[2]) * time.Second
-			newRules[id] = existing
-		} else {
-			newRules[id] = &ruleState{
-				windowSize: time.Duration(cfg[0]) * time.Second,
-				threshold:  cfg[1],
-				cooldown:   time.Duration(cfg[2]) * time.Second,
-				timestamps: make([]int64, 0),
-				samples:    make([]string, 0),
-			}
-		}
-	}
-	am.rules = newRules
-}
-
-func (am *Manager) Record(ruleID, ruleName string, logContent string, tags map[string]string) {
+func (am *Manager) Record(result rule.MatchResult, logContent string) {
 	now := time.Now().UnixMilli()
+	windowSize := time.Duration(result.Alert.WindowSeconds) * time.Second
+	cooldown := time.Duration(result.Alert.CooldownSeconds) * time.Second
+	threshold := result.Alert.Threshold
 
 	am.mu.Lock()
-	state, ok := am.rules[ruleID]
+	state, ok := am.rules[result.RuleID]
 	if !ok {
-		am.mu.Unlock()
-		return
+		state = &ruleState{
+			timestamps: make([]int64, 0),
+			samples:    make([]string, 0),
+		}
+		am.rules[result.RuleID] = state
 	}
 
-	cutoff := now - state.windowSize.Milliseconds()
+	cutoff := now - windowSize.Milliseconds()
 	i := 0
 	for i < len(state.timestamps) && state.timestamps[i] < cutoff {
 		i++
@@ -109,20 +73,20 @@ func (am *Manager) Record(ruleID, ruleName string, logContent string, tags map[s
 	}
 
 	count := len(state.timestamps)
-	shouldAlert := count >= state.threshold && (now-state.lastAlert) > state.cooldown.Milliseconds()
+	shouldAlert := count >= threshold && (now-state.lastAlert) > cooldown.Milliseconds()
 
 	var event *AlertEvent
 	if shouldAlert {
 		state.lastAlert = now
 		samplesCopy := make([]string, len(state.samples))
 		copy(samplesCopy, state.samples)
-		tagsCopy := make(map[string]string, len(tags))
-		for k, v := range tags {
+		tagsCopy := make(map[string]string, len(result.Tags))
+		for k, v := range result.Tags {
 			tagsCopy[k] = v
 		}
 		event = &AlertEvent{
-			RuleID:      ruleID,
-			RuleName:    ruleName,
+			RuleID:      result.RuleID,
+			RuleName:    result.RuleName,
 			Count:       count,
 			WindowStart: state.timestamps[0],
 			WindowEnd:   now,

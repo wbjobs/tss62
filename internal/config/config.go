@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
@@ -43,11 +44,14 @@ type AppConfig struct {
 }
 
 type ConfigLoader struct {
-	path     string
-	config   *AppConfig
-	mu       sync.RWMutex
-	watcher  *fsnotify.Watcher
-	onChange func(*AppConfig)
+	path         string
+	config       *AppConfig
+	mu           sync.RWMutex
+	watcher      *fsnotify.Watcher
+	onChange     func(*AppConfig)
+	debounceDur  time.Duration
+	debounceMu   sync.Mutex
+	debounceTimer *time.Timer
 }
 
 func DefaultAlertConfig() *AlertRuleConfig {
@@ -93,8 +97,9 @@ func Load(path string) (*AppConfig, error) {
 
 func NewConfigLoader(path string, onChange func(*AppConfig)) (*ConfigLoader, error) {
 	cl := &ConfigLoader{
-		path:     path,
-		onChange: onChange,
+		path:        path,
+		onChange:    onChange,
+		debounceDur: 500 * time.Millisecond,
 	}
 	cfg, err := Load(path)
 	if err != nil {
@@ -126,17 +131,24 @@ func (cl *ConfigLoader) watchLoop() {
 				return
 			}
 			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
-				cfg, err := Load(cl.path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "reload config failed: %v\n", err)
-					continue
+				cl.debounceMu.Lock()
+				if cl.debounceTimer != nil {
+					cl.debounceTimer.Stop()
 				}
-				cl.mu.Lock()
-				cl.config = cfg
-				cl.mu.Unlock()
-				if cl.onChange != nil {
-					cl.onChange(cfg)
-				}
+				cl.debounceTimer = time.AfterFunc(cl.debounceDur, func() {
+					cfg, err := Load(cl.path)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "reload config failed: %v\n", err)
+						return
+					}
+					cl.mu.Lock()
+					cl.config = cfg
+					cl.mu.Unlock()
+					if cl.onChange != nil {
+						cl.onChange(cfg)
+					}
+				})
+				cl.debounceMu.Unlock()
 			}
 		case err, ok := <-cl.watcher.Errors:
 			if !ok {

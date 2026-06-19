@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"logmonitor/internal/alert"
@@ -19,9 +20,19 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	flag.Parse()
 
-	cfgLoader, err := config.NewConfigLoader(*configPath, func(cfg *config.AppConfig) {
-		log.Println("config reloaded")
-	})
+	var (
+		engine    *rule.Engine
+		reloadMu  sync.Mutex
+	)
+
+	reloadFn := func(cfg *config.AppConfig) {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		engine.Reload(cfg)
+		log.Println("rules reloaded")
+	}
+
+	cfgLoader, err := config.NewConfigLoader(*configPath, reloadFn)
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
 	}
@@ -35,60 +46,18 @@ func main() {
 	}
 	defer store.Close()
 
-	engine := rule.NewEngine(cfg)
+	engine = rule.NewEngine(cfg)
 	alertMgr := alert.NewManager()
-
-	alertRules := make(map[string][3]int)
-	for _, r := range cfg.Rules {
-		if !r.Enabled {
-			continue
-		}
-		cooldown := r.AlertConfig.CooldownSeconds
-		if cooldown <= 0 {
-			cooldown = 30
-		}
-		alertRules[r.ID] = [3]int{
-			r.AlertConfig.WindowSeconds,
-			r.AlertConfig.Threshold,
-			cooldown,
-		}
-	}
-	alertMgr.ReloadRules(alertRules)
-
-	cfgLoader2 := cfgLoader
-	engine2 := engine
-	alertMgr2 := alertMgr
-	_ = cfgLoader2
-	_ = engine2
-	_ = alertMgr2
 
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGHUP)
 		for range ch {
-			c := cfgLoader.Get()
-			engine.Reload(c)
-			ar := make(map[string][3]int)
-			for _, r := range c.Rules {
-				if !r.Enabled {
-					continue
-				}
-				cooldown := r.AlertConfig.CooldownSeconds
-				if cooldown <= 0 {
-					cooldown = 30
-				}
-				ar[r.ID] = [3]int{
-					r.AlertConfig.WindowSeconds,
-					r.AlertConfig.Threshold,
-					cooldown,
-				}
-			}
-			alertMgr.ReloadRules(ar)
-			log.Println("rules reloaded via SIGHUP")
+			reloadFn(cfgLoader.Get())
 		}
 	}()
 
-	collectorSrv := collector.NewServer(engine, store, alertMgr, 128)
+	collectorSrv := collector.NewServer(engine, store, alertMgr, 128, 65536)
 	notifierSrv := notifier.NewServer(alertMgr)
 
 	errCh := make(chan error, 2)
